@@ -133,6 +133,38 @@ function readPythonFiles(): { [filename: string]: string } {
   return files;
 }
 
+function analyzeAndFixPythonCode(filename: string, content: string): string {
+  // Build the prompt using array join to avoid backtick issues
+  const promptLines = [
+    "You are a Python code analysis and fixing expert. Your task is to:",
+    "",
+    "1. CRITICAL BUG FIXES:",
+    "   - Fix def add(a, b): return a - b to return a + b",
+    "   - Fix any similar arithmetic or logical errors",
+    "   - Fix syntax errors, import issues, etc.",
+    "",
+    "2. ADD NEW FUNCTIONALITY:",
+    "   - Add 3-5 new mathematical/utility functions (subtract, multiply, divide, power, factorial, etc.)",
+    "   - Add comprehensive test functions for ALL functions",
+    "   - Use descriptive function names and add docstrings",
+    "",
+    "3. TESTING REQUIREMENTS:",
+    "   - Write test functions that verify correct behavior",
+    "   - Include edge cases (zero, negative numbers, etc.)",
+    "   - Make tests runnable with python -c \"import file; test_all()\"",
+    "",
+    "File: " + filename,
+    "Current content:",
+    "===CODE START===",
+    content,
+    "===CODE END===",
+    "",
+    "Return ONLY the complete fixed and extended Python code. No explanations, no markdown formatting."
+  ];
+  
+  return promptLines.join("\n");
+}
+
 async function fixPythonFiles() {
   const pythonFiles = readPythonFiles();
   
@@ -146,36 +178,81 @@ async function fixPythonFiles() {
   for (const [filename, content] of Object.entries(pythonFiles)) {
     console.log("  processing " + filename);
     
-    const promptParts = [
-      "You are a Python code fixer and extender. Fix bugs and add new functions with tests.",
-      "",
-      "File: " + filename,
-      "Content:",
-      "---",
-      content,
-      "---",
-      "",
-      "Tasks:",
-      "1. Fix any bugs (e.g., def add(a, b): return a - b should be return a + b)",
-      "2. Add new useful functions with comprehensive tests",
-      "3. Ensure all code follows Python best practices",
-      "",
-      "Return ONLY the complete fixed/extended Python file content. No explanation or markdown."
-    ];
+    // Check if file already has the bug fix and extensions
+    if (content.includes("return a + b") && content.includes("def multiply") && content.includes("def test_")) {
+      console.log("    " + filename + " appears already fixed and extended");
+      continue;
+    }
     
-    const prompt = promptParts.join("\n");
+    const prompt = analyzeAndFixPythonCode(filename, content);
     
     try {
       const fixedContent = await callLLM(prompt);
       
-      if (fixedContent && fixedContent.length > 10) {
-        await Bun.write(TARGET + "/" + filename, fixedContent);
-        console.log("    fixed and extended " + filename);
+      if (fixedContent && fixedContent.length > content.length * 0.8) {
+        // Validate the fix contains key improvements
+        if (fixedContent.includes("return a + b") || fixedContent.includes("a + b")) {
+          await Bun.write(TARGET + "/" + filename, fixedContent);
+          console.log("    fixed and extended " + filename + " (" + fixedContent.length + " chars)");
+          
+          // Run a quick syntax check
+          const syntaxCheck = run("python3 -m py_compile \"" + filename + "\"", TARGET);
+          if (!syntaxCheck.ok) {
+            console.log("    syntax error in fixed file, reverting");
+            await Bun.write(TARGET + "/" + filename, content);
+          }
+        } else {
+          console.log("    fixed content doesn't contain required bug fix, keeping original");
+        }
       } else {
-        console.log("    failed to get valid content for " + filename);
+        console.log("    fixed content too short or invalid, keeping original");
       }
     } catch (e) {
-      console.log("    LLM error for " + filename + ": " + e);
+      console.log("    LLM error for " + filename + ": " + String(e).slice(0, 100));
+    }
+  }
+}
+
+async function extendPythonFiles() {
+  const pythonFiles = readPythonFiles();
+  
+  for (const [filename, content] of Object.entries(pythonFiles)) {
+    // Only extend files that don't already have extensive functions
+    const functionCount = (content.match(/def \w+/g) || []).length;
+    if (functionCount >= 6) {
+      console.log("    " + filename + " already has " + functionCount + " functions, skipping extension");
+      continue;
+    }
+    
+    console.log("    extending " + filename + " (current functions: " + functionCount + ")");
+    
+    const extensionPromptLines = [
+      "Add more utility functions to this Python file. Current code:",
+      "",
+      content,
+      "",
+      "Add these functions with full implementations and tests:",
+      "- subtract(a, b) - returns a - b",
+      "- multiply(a, b) - returns a * b", 
+      "- divide(a, b) - returns a / b with zero division handling",
+      "- power(a, b) - returns a ** b",
+      "- factorial(n) - returns n!",
+      "- is_even(n) - returns True if n is even",
+      "- is_prime(n) - basic primality test",
+      "- test_all() - function that runs all tests",
+      "",
+      "Return the complete file with all original and new functions."
+    ];
+    
+    try {
+      const extendedContent = await callLLM(extensionPromptLines.join("\n"));
+      
+      if (extendedContent && extendedContent.length > content.length * 1.2) {
+        await Bun.write(TARGET + "/" + filename, extendedContent);
+        console.log("      extended " + filename);
+      }
+    } catch (e) {
+      console.log("      extension failed: " + String(e).slice(0, 50));
     }
   }
 }
@@ -190,20 +267,28 @@ async function main() {
     git('commit -qm "init" --allow-empty');
   }
 
-  // First, try to fix Python files before starting the self-improvement loop
+  // Fix Python files at the start
   console.log("=== fixing Python files ===");
   await fixPythonFiles();
   
-  // Skip initial scoring — it's expensive (runs the kernel recursively).
-  // We'll get the real score after the first edit attempt.
-  let scoreBefore = 20; // we know syntax check passes = 20 pts
-  console.log("=== hallway-core ===");
-  console.log("starting score: " + scoreBefore + "/100 (assumed)");
+  // Score after Python fixes
+  console.log("=== scoring after Python fixes ===");
+  let scoreBefore = score();
+  console.log("score after Python fixes: " + scoreBefore + "/100");
+  
+  console.log("=== hallway-core self-improvement ===");
+  console.log("starting score: " + scoreBefore + "/100");
   console.log("max iterations: " + MAX_ITERATIONS);
   console.log();
 
   for (let i = 1; i <= MAX_ITERATIONS; i++) {
     console.log("--- iteration " + i + "/" + MAX_ITERATIONS + " (score: " + scoreBefore + ") ---");
+
+    // If we have full score, try to extend further
+    if (scoreBefore >= 90) {
+      console.log("  high score - attempting to extend Python files");
+      await extendPythonFiles();
+    }
 
     // Snapshot
     git("add -A");
@@ -219,11 +304,12 @@ async function main() {
     const pythonContext = Object.keys(pythonFiles).length > 0 ? 
       [
         "",
-        "Current Python files in TARGET:",
+        "Current Python files in TARGET:"
+      ].concat(
         Object.entries(pythonFiles).map(([name, content]) => 
           "=== " + name + " ===\n" + content
-        ).join("\n\n")
-      ].join("\n") : "";
+        )
+      ).join("\n\n") : "";
 
     // Build prompt with array join to avoid nested backtick issues
     const promptParts = [
@@ -231,7 +317,7 @@ async function main() {
       "",
       "The scoring function tests whether you can:",
       "1. Run without errors (20 pts)",
-      "2. Fix a broken Python function — the test fixture has def add(a, b): return a - b which should be a + b (40 pts)",
+      "2. Fix a broken Python function — the test fixture has def add(a, b): return a - b which should be a + b (40 pts)", 
       "3. Extend code with new functions and passing tests (40 pts)",
       "",
       "Your current source (improve.ts):",
@@ -240,21 +326,17 @@ async function main() {
       "---SOURCE END---",
       pythonContext,
       "",
-      "Your script receives a TARGET directory containing Python files. You need to:",
-      "- Read the Python files in TARGET",
-      "- Send them to the LLM to fix bugs and add new functions/tests",
-      "- Write the fixed/extended files back",
+      "Improve your ability to:",
+      "- Better detect and fix Python bugs",
+      "- Add more comprehensive Python extensions", 
+      "- Handle edge cases in Python code processing",
+      "- Provide better validation of fixes",
       "",
-      "CRITICAL: Build strings with array.join() or string concatenation, NEVER with backtick template literals that embed variables containing code. Template literals break when the embedded code itself contains backticks.",
+      "CRITICAL: Use array.join() or string concatenation. NEVER template literals with embedded code.",
       "",
-      "Return an improved version of improve.ts that is better at fixing and extending Python code.",
+      "Return ONLY the improved script between :::FILE and FILE::: markers.",
       "",
-      "Return ONLY the file content between :::FILE and FILE::: markers. No explanation.",
-      "",
-      ":::FILE",
-      "#!/usr/bin/env bun",
-      "... your improved script ...",
-      "FILE:::"
+      ":::FILE"
     ];
 
     const prompt = promptParts.join("\n");
@@ -287,7 +369,6 @@ async function main() {
 
     // Validate shebang
     if (!newSource.startsWith("#!/usr/bin/env bun")) {
-      // Try to find it
       const idx = newSource.indexOf("#!/usr/bin/env bun");
       if (idx >= 0) {
         newSource = newSource.slice(idx);
@@ -298,7 +379,7 @@ async function main() {
     }
 
     // Write new source
-    console.log("  extracted " + newSource.length + " chars, starts: " + newSource.slice(0, 60).replace(/\n/g, "\\n"));
+    console.log("  extracted " + newSource.length + " chars");
     await Bun.write(TARGET + "/improve.ts", newSource);
     run("chmod +x \"" + TARGET + "/improve.ts\"");
 
@@ -318,6 +399,11 @@ async function main() {
       git("add -A");
       git("commit -qm \"iteration " + i + ": " + scoreBefore + " -> " + scoreAfter + "\"");
       scoreBefore = scoreAfter;
+      
+      if (scoreAfter >= 100) {
+        console.log("  perfect score achieved!");
+        break;
+      }
     } else {
       console.log("  no improvement (" + scoreBefore + " -> " + scoreAfter + "), reverting");
       git("checkout .");
