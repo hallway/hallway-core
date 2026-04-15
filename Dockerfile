@@ -5,12 +5,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && pip3 install pytest --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git config --global user.email "kernel@hallway.sh" \
-    && git config --global user.name "hallway-core"
+RUN git config --global user.email "organism@hallway.sh" \
+    && git config --global user.name "organism"
+
+RUN mkdir -p /work
 
 COPY improve.ts /kernel/improve.ts
-COPY Dockerfile /kernel/Dockerfile
 RUN chmod +x /kernel/improve.ts
 
-WORKDIR /kernel
-ENTRYPOINT ["bun", "run", "/kernel/improve.ts", "/kernel"]
+WORKDIR /work
+ENTRYPOINT ["bun", "run", "/kernel/improve.ts"]

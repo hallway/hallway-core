@@ -1,0 +1,7 @@
+output/
+population/
+node_modules/
+hallway.db
+hallway.db-shm
+hallway.db-wal
+.cursor/
