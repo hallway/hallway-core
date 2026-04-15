@@ -1,0 +1,12 @@
+{
+  "name": "broken-api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "bun server.js",
+    "test": "bun test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
