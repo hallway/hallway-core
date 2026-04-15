@@ -34,7 +34,7 @@ function run(cmd: string, cwd = TARGET, timeoutMs?: number): { ok: boolean; out:
 }
 
 function git(args: string, cwd = TARGET) {
-  return run(`git ${args}`, cwd);
+  return run("git " + args, cwd);
 }
 
 async function callLLM(prompt: string): Promise<string> {
@@ -45,16 +45,16 @@ async function callLLM(prompt: string): Promise<string> {
     messages: [{ role: "user", content: prompt }],
   });
 
-  const tmpReq = `/tmp/llm-req-${Date.now()}.json`;
+  const tmpReq = "/tmp/llm-req-" + Date.now() + ".json";
   await Bun.write(tmpReq, reqBody);
 
   const result = Bun.spawnSync([
     "curl", "-sS", "--max-time", "120",
     "https://api.anthropic.com/v1/messages",
-    "-H", `x-api-key: ${API_KEY}`,
+    "-H", "x-api-key: " + API_KEY,
     "-H", "anthropic-version: 2023-06-01",
     "-H", "content-type: application/json",
-    "-d", `@${tmpReq}`,
+    "-d", "@" + tmpReq,
   ], { stdout: "pipe", stderr: "pipe" });
 
   // Cleanup request file
@@ -64,36 +64,44 @@ async function callLLM(prompt: string): Promise<string> {
   const stderr = result.stderr.toString();
 
   if (result.exitCode !== 0) {
-    throw new Error(`curl failed (exit ${result.exitCode}): ${stderr.slice(0, 200)}`);
+    throw new Error("curl failed (exit " + result.exitCode + "): " + stderr.slice(0, 200));
   }
 
   if (!stdout.trim()) {
-    throw new Error(`curl returned empty response. stderr: ${stderr.slice(0, 200)}`);
+    throw new Error("curl returned empty response. stderr: " + stderr.slice(0, 200));
   }
 
   let data: any;
   try {
     data = JSON.parse(stdout);
   } catch {
-    throw new Error(`invalid JSON from API: ${stdout.slice(0, 200)}`);
+    throw new Error("invalid JSON from API: " + stdout.slice(0, 200));
   }
 
   if (data.error) {
-    throw new Error(`API error: ${JSON.stringify(data.error).slice(0, 200)}`);
+    throw new Error("API error: " + JSON.stringify(data.error).slice(0, 200));
   }
 
   return data.content?.[0]?.text || "";
 }
 
 function score(): number {
-  const result = run(`bun run /scoring/score.ts "${TARGET}"`, TARGET, 300_000);
-  const num = parseInt(result.out.trim().split("\n").pop() || "0");
+  // score.ts logs to stderr, outputs the number on stdout
+  // run() merges both — so we run separately to get clean stdout
+  const result = Bun.spawnSync(["bash", "-c", "bun run /scoring/score.ts \"" + TARGET + "\""], {
+    cwd: TARGET,
+    stdout: "pipe",
+    stderr: "inherit", // show scoring progress in real time
+    env: { ...process.env, MAX_ITERATIONS: "3" },
+    timeout: 300_000,
+  });
+  const num = parseInt(result.stdout.toString().trim().split("\n").pop() || "0");
   return isNaN(num) ? 0 : num;
 }
 
 function readSource(): string {
   try {
-    return Bun.file(`${TARGET}/improve.ts`).text() as unknown as string;
+    return Bun.file(TARGET + "/improve.ts").text() as unknown as string;
   } catch {
     return "";
   }
@@ -101,42 +109,124 @@ function readSource(): string {
 
 // use sync version
 function readSourceSync(): string {
-  const result = run(`cat "${TARGET}/improve.ts"`);
+  const result = run("cat \"" + TARGET + "/improve.ts\"");
   return result.ok ? result.out : "";
+}
+
+function findPythonFiles(dir: string): string[] {
+  const result = run("find . -name '*.py' -type f", dir);
+  if (!result.ok) return [];
+  return result.out.trim().split("\n").filter(f => f.length > 0);
+}
+
+function readPythonFiles(): { [filename: string]: string } {
+  const files: { [filename: string]: string } = {};
+  const pythonFiles = findPythonFiles(TARGET);
+  
+  for (const filename of pythonFiles) {
+    const result = run("cat \"" + filename + "\"", TARGET);
+    if (result.ok) {
+      files[filename] = result.out;
+    }
+  }
+  
+  return files;
+}
+
+async function fixPythonFiles() {
+  const pythonFiles = readPythonFiles();
+  
+  if (Object.keys(pythonFiles).length === 0) {
+    console.log("  no Python files found");
+    return;
+  }
+  
+  console.log("  found " + Object.keys(pythonFiles).length + " Python files");
+  
+  for (const [filename, content] of Object.entries(pythonFiles)) {
+    console.log("  processing " + filename);
+    
+    const promptParts = [
+      "You are a Python code fixer and extender. Fix bugs and add new functions with tests.",
+      "",
+      "File: " + filename,
+      "Content:",
+      "---",
+      content,
+      "---",
+      "",
+      "Tasks:",
+      "1. Fix any bugs (e.g., def add(a, b): return a - b should be return a + b)",
+      "2. Add new useful functions with comprehensive tests",
+      "3. Ensure all code follows Python best practices",
+      "",
+      "Return ONLY the complete fixed/extended Python file content. No explanation or markdown."
+    ];
+    
+    const prompt = promptParts.join("\n");
+    
+    try {
+      const fixedContent = await callLLM(prompt);
+      
+      if (fixedContent && fixedContent.length > 10) {
+        await Bun.write(TARGET + "/" + filename, fixedContent);
+        console.log("    fixed and extended " + filename);
+      } else {
+        console.log("    failed to get valid content for " + filename);
+      }
+    } catch (e) {
+      console.log("    LLM error for " + filename + ": " + e);
+    }
+  }
 }
 
 // --- main loop ---
 
 async function main() {
   // Ensure git is initialized
-  if (!run(`test -d .git`).ok) {
+  if (!run("test -d .git").ok) {
     git("init -q -b main");
     git("add -A");
     git('commit -qm "init" --allow-empty');
   }
 
+  // First, try to fix Python files before starting the self-improvement loop
+  console.log("=== fixing Python files ===");
+  await fixPythonFiles();
+  
   // Skip initial scoring — it's expensive (runs the kernel recursively).
   // We'll get the real score after the first edit attempt.
   let scoreBefore = 20; // we know syntax check passes = 20 pts
   console.log("=== hallway-core ===");
-  console.log(`starting score: ${scoreBefore}/100 (assumed)`);
-  console.log(`max iterations: ${MAX_ITERATIONS}`);
+  console.log("starting score: " + scoreBefore + "/100 (assumed)");
+  console.log("max iterations: " + MAX_ITERATIONS);
   console.log();
 
   for (let i = 1; i <= MAX_ITERATIONS; i++) {
-    console.log(`--- iteration ${i}/${MAX_ITERATIONS} (score: ${scoreBefore}) ---`);
+    console.log("--- iteration " + i + "/" + MAX_ITERATIONS + " (score: " + scoreBefore + ") ---");
 
     // Snapshot
     git("add -A");
     if (!git("diff --cached --quiet").ok) {
-      git(`commit -qm "pre-iteration-${i}"`);
+      git("commit -qm \"pre-iteration-" + i + "\"");
     }
 
     // Read current source
     const currentSource = readSourceSync();
+    
+    // Read Python files to include in context
+    const pythonFiles = readPythonFiles();
+    const pythonContext = Object.keys(pythonFiles).length > 0 ? 
+      [
+        "",
+        "Current Python files in TARGET:",
+        Object.entries(pythonFiles).map(([name, content]) => 
+          "=== " + name + " ===\n" + content
+        ).join("\n\n")
+      ].join("\n") : "";
 
     // Build prompt with array join to avoid nested backtick issues
-    const prompt = [
+    const promptParts = [
       "You are a self-improving system written in TypeScript (Bun runtime). Your score is " + scoreBefore + "/100.",
       "",
       "The scoring function tests whether you can:",
@@ -148,6 +238,7 @@ async function main() {
       "---SOURCE START---",
       currentSource,
       "---SOURCE END---",
+      pythonContext,
       "",
       "Your script receives a TARGET directory containing Python files. You need to:",
       "- Read the Python files in TARGET",
@@ -163,14 +254,16 @@ async function main() {
       ":::FILE",
       "#!/usr/bin/env bun",
       "... your improved script ...",
-      "FILE:::",
-    ].join("\n");
+      "FILE:::"
+    ];
+
+    const prompt = promptParts.join("\n");
 
     let reply: string;
     try {
       reply = await callLLM(prompt);
     } catch (e) {
-      console.log(`  LLM error: ${e}`);
+      console.log("  LLM error: " + e);
       continue;
     }
 
@@ -205,14 +298,14 @@ async function main() {
     }
 
     // Write new source
-    console.log(`  extracted ${newSource.length} chars, starts: ${newSource.slice(0, 60).replace(/\n/g, "\\n")}`);
-    await Bun.write(`${TARGET}/improve.ts`, newSource);
-    run(`chmod +x "${TARGET}/improve.ts"`);
+    console.log("  extracted " + newSource.length + " chars, starts: " + newSource.slice(0, 60).replace(/\n/g, "\\n"));
+    await Bun.write(TARGET + "/improve.ts", newSource);
+    run("chmod +x \"" + TARGET + "/improve.ts\"");
 
     // Syntax check
-    const check = run(`bun build --no-bundle "${TARGET}/improve.ts" 2>&1`);
+    const check = run("bun build --no-bundle \"" + TARGET + "/improve.ts\" 2>&1");
     if (!check.ok) {
-      console.log(`  syntax error, reverting. Detail: ${check.out.slice(0, 150)}`);
+      console.log("  syntax error, reverting. Detail: " + check.out.slice(0, 150));
       git("checkout .");
       continue;
     }
@@ -221,19 +314,19 @@ async function main() {
     const scoreAfter = score();
 
     if (scoreAfter > scoreBefore) {
-      console.log(`  improved: ${scoreBefore} -> ${scoreAfter} ✓`);
+      console.log("  improved: " + scoreBefore + " -> " + scoreAfter + " ✓");
       git("add -A");
-      git(`commit -qm "iteration ${i}: ${scoreBefore} -> ${scoreAfter}"`);
+      git("commit -qm \"iteration " + i + ": " + scoreBefore + " -> " + scoreAfter + "\"");
       scoreBefore = scoreAfter;
     } else {
-      console.log(`  no improvement (${scoreBefore} -> ${scoreAfter}), reverting`);
+      console.log("  no improvement (" + scoreBefore + " -> " + scoreAfter + "), reverting");
       git("checkout .");
     }
   }
 
   console.log();
   console.log("=== done ===");
-  console.log(`final score: ${scoreBefore}/100`);
+  console.log("final score: " + scoreBefore + "/100");
 }
 
 main().catch((e) => {
